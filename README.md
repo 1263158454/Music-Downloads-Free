@@ -7,11 +7,34 @@
 | 命令 | 功能 |
 |:---|:---|
 | `search <关键词>` | 跨 5 个音乐源搜索歌曲 |
-| `download <关键词>` | 单首下载（多源链 + 完整性校验 + 文件名自动清理） |
-| `download-idx <N> <关键词>` | 搜索结果中指定序号下载 |
-| `download-playlist <URL>` | 下载网易云歌单全部歌曲 |
+| `check-duplicate <关键词>` | 检测本地是否已有该歌曲（歌名+歌手+时长三重匹配） |
+| `download <关键词> [--action skip\|overwrite\|coexist]` | 单首下载（重复检测 + 多源链 + 完整性校验） |
+| `download-idx <N> <关键词> [--action skip\|overwrite\|coexist]` | 搜索结果中指定序号下载 |
+| `download-playlist <URL> [--action skip\|overwrite\|coexist]` | 下载网易云歌单（逐首检测重复 + 批量策略） |
 | `check-playlist <路径>` | 完整性检测 |
 | `rename [路径]` | 批量清理文件名（去随机ID + 删重复） |
+
+## 🔄 重复检测机制
+
+三重匹配策略，避免重复下载：
+
+| 维度 | 匹配条件 |
+|:---|:---|
+| 🏷️ **歌名** | 归一化后字符串相似度 ≥ 0.8 |
+| 👤 **歌手** | 歌手关键词出现在文件名中 |
+| ⏱ **时长** | 实际时长与预期偏差 ≤ ±15% |
+
+**置信度高** → 自动跳过；**拿捏不准** → 输出结构化信息供用户决策。
+
+支持 `--action` 参数指定重复处理策略：
+
+| 参数 | 效果 |
+|:---|:---|
+| `--action skip` | 跳过，保留原文件 |
+| `--action overwrite` | 删除旧文件，下载新文件 |
+| `--action coexist` | 并存（自动加 (1) 后缀） |
+
+歌单下载时，`--action` 对剩余所有歌曲批量生效，无需逐首确认。
 
 ## 🚀 快速开始
 
@@ -48,11 +71,17 @@ cd Music-Downloads-Free
 # 搜索歌曲
 python scripts/music.py search 晴天 周杰伦
 
-# 下载单首
-python scripts/music.py download 晴天 周杰伦
+# 预检是否已存在
+python scripts/music.py check-duplicate 晴天 周杰伦
 
-# 下载歌单
-python scripts/music.py download-playlist "https://music.163.com/playlist?id=xxx"
+# 下载单首（自动跳过已存在的）
+python scripts/music.py download 晴天 周杰伦 --action skip
+
+# 覆盖已有的
+python scripts/music.py download 晴天 周杰伦 --action overwrite
+
+# 下载歌单（重复的跳过）
+python scripts/music.py download-playlist "https://music.163.com/playlist?id=xxx" --action skip
 
 # 清理文件名
 python scripts/music.py rename /path/to/music/folder
@@ -76,9 +105,11 @@ QQ音乐 (主源) → 网易云 → 酷狗 → 酷我 → 咪咕
 
 ```
 Music-Downloads-Free/
-├── SKILL.md                        ← 完整技能文档（含安装/校验/Agent约束）
+├── SKILL.md                        ← 完整技能文档（含安装/校验/Agent约束/重复检测机制）
+├── README.md                       ← 本文件
 ├── scripts/
-│   └── music.py                    ← 主脚本（6个命令）
+│   ├── music.py                    ← 主脚本（8个命令）
+│   └── music_ssl.py               ← SSL 降级 wrapper（CA证书过旧时备用）
 └── references/
     ├── musicdl-modifications.md    ← 码率修改记录
     ├── netease-playlist-api.md     ← 歌单API文档
