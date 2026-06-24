@@ -2,6 +2,7 @@
 """
 Music Downloader — 多源搜索下载歌曲 (mp3 320k)
 支持: search / download / download-idx / download-playlist / check-playlist
+      check-duplicate / rename
 """
 import sys, os, re, time, json, subprocess, urllib.request, urllib.parse
 
@@ -9,21 +10,20 @@ sys.path.insert(0, '/home/admin/Downloads/musicdl')
 from musicdl.modules import BuildMusicClient, LoggerHandle
 
 WORK_DIR = '/home/admin/Music'
-RETRY_COUNT = 2       # QQ搜索重试3次，保证主源覆盖
+RETRY_COUNT = 2
 RETRY_DELAY = 3
 
-# 多源链: 主源QQ保持全深度，其他源快速试一轮
 SOURCE_CHAIN = [
-    ('QQMusicClient',      'QQ音乐',   60,  True),   # 主源，给足时间搜全
-    ('NeteaseMusicClient', '网易云',   45,  False),  # 备源1
-    ('KugouMusicClient',   '酷狗',     30,  False),  # 备源2
-    ('KuwoMusicClient',    '酷我',     20,  False),  # 备源3 (快速)
-    ('MiguMusicClient',    '咪咕',     15,  False),  # 备源4 (快速)
+    ('QQMusicClient',      'QQ音乐',   60,  True),
+    ('NeteaseMusicClient', '网易云',   45,  False),
+    ('KugouMusicClient',   '酷狗',     30,  False),
+    ('KuwoMusicClient',    '酷我',     20,  False),
+    ('MiguMusicClient',    '咪咕',     15,  False),
 ]
 
 BASE_CFG = {
     'auto_set_proxies': False, 'max_retries': 1, 'maintain_session': False,
-    'disable_print': True, 'search_size_per_page': 5,  # 搜5条，给够候选
+    'disable_print': True, 'search_size_per_page': 5,
     'strict_limit_search_size_per_page': True,
     'quark_parser_config': {}, 'freeproxy_settings': None,
     'enable_download_curl_cffi': False, 'enable_parse_curl_cffi': False,
@@ -34,6 +34,7 @@ BASE_CFG = {
 
 MIN_VALID_DURATION_S = 30
 MIN_DURATION_RATIO = 0.50
+DURATION_MATCH_TOLERANCE = 0.15  # ±15% 认为时长匹配
 
 
 # ─── 工具函数 ───
@@ -111,12 +112,7 @@ def _sanitize_folder(name: str) -> str:
     return re.sub(r'[<>:"/\\|?*]', '_', name).strip()[:100]
 
 
-
 def _rename_file_suffix(path: str) -> str:
-    """Strip random media ID suffix from filename.
-    'xxx - 001YvwLN0Gj9fc.m4a' -> 'xxx.m4a'
-    'xxx - 29819059.mp3'     -> 'xxx.mp3'
-    """
     d, basename = os.path.dirname(path), os.path.basename(path)
     stem, ext = os.path.splitext(basename)
     new_stem = re.sub(r' - [A-Za-z0-9]+(\s*\(1\))?$', '', stem).strip()
@@ -135,7 +131,6 @@ def _rename_file_suffix(path: str) -> str:
 
 
 def _clean_song_path(filepath: str) -> str:
-    """Rename song file + matching .lrc to remove random suffix."""
     new_fp = _rename_file_suffix(filepath)
     old_lrc = os.path.splitext(filepath)[0] + '.lrc'
     if os.path.exists(old_lrc):
@@ -147,6 +142,7 @@ def _clean_song_path(filepath: str) -> str:
                 pass
     return new_fp
 
+
 def _parse_playlist_id(url: str) -> str:
     m = re.search(r'id=(\d+)', url)
     if m:
@@ -155,11 +151,149 @@ def _parse_playlist_id(url: str) -> str:
     return m.group(1) if m else url.strip()
 
 
+def _extract_name_from_filename(fname: str) -> str:
+    """从文件名中提取歌名（去掉歌手前缀、扩展名、随机后缀）"""
+    stem, _ = os.path.splitext(fname)
+    # 去掉随机ID后缀
+    stem = re.sub(r' - [A-Za-z0-9]+$', '', stem).strip()
+    stem = re.sub(r' - \d+$', '', stem).strip()
+    return stem
+
+
+def _name_similarity(name1: str, name2: str) -> float:
+    """计算两个歌名的相似度 (0.0~1.0)"""
+    n1 = re.sub(r'[^\w\u4e00-\u9fff]', '', name1.lower())
+    n2 = re.sub(r'[^\w\u4e00-\u9fff]', '', name2.lower())
+    if not n1 or not n2:
+        return 0.0
+    # 完全匹配
+    if n1 == n2:
+        return 1.0
+    # 一个包含另一个
+    if n1 in n2 or n2 in n1:
+        return 0.8
+    # 编辑距离相似度（简化版：共同字符比例）
+    common = len(set(n1) & set(n2))
+    return common / max(len(set(n1)), len(set(n2)), 1)
+
+
+def _find_duplicate(song_name: str, artists: str, expected_duration_ms: int,
+                    output_dir: str) -> dict:
+    """
+    检查 output_dir 中是否已有该歌曲的重复。
+
+    匹配策略（三重匹配）:
+      1. 歌名相似度 ≥ 0.8 AND 歌手有重叠 → 高置信度
+      2. 歌名相似度 ≥ 0.6 AND 时长在 ±15% 内 → 中置信度
+      3. 歌名相似度 ≥ 0.6 但时长不符 → 低置信度（需用户确认）
+
+    返回:
+      {'exists': bool, 'files': [{path, name_match, artist_match, duration_match, ...}],
+       'confidence': 'high'|'medium'|'low', 'recommendation': 'skip'|'ask'}
+    """
+    audio_exts = {'.mp3', '.m4a', '.flac', '.ogg', '.wav', '.aac'}
+    if not os.path.exists(output_dir):
+        return {'exists': False, 'files': [], 'confidence': 'high', 'recommendation': 'download'}
+
+    files = [f for f in os.listdir(output_dir)
+             if os.path.splitext(f)[1].lower() in audio_exts and os.path.isfile(os.path.join(output_dir, f))]
+    if not files:
+        return {'exists': False, 'files': [], 'confidence': 'high', 'recommendation': 'download'}
+
+    artist_keywords = [a.strip().lower() for a in artists.split(',')] if artists else []
+
+    candidates = []
+    for fname in files:
+        stem = _extract_name_from_filename(fname)
+        name_sim = _name_similarity(song_name, stem)
+
+        # 文件名中是否有歌手关键词
+        artist_match = any(ak in fname.lower() for ak in artist_keywords) if artist_keywords else False
+
+        # 检查实际文件时长
+        fpath = os.path.join(output_dir, fname)
+        actual_dur = _get_audio_duration(fpath)
+
+        expected_s = expected_duration_ms / 1000.0 if expected_duration_ms > 0 else 0
+        duration_match = False
+        dur_diff = 0
+        if expected_s > 0 and actual_dur > 0:
+            ratio = actual_dur / expected_s
+            dur_diff = abs(ratio - 1.0)
+            duration_match = dur_diff <= DURATION_MATCH_TOLERANCE
+
+        if name_sim < 0.3:
+            continue  # 歌名完全不匹配，跳过
+
+        candidates.append({
+            'path': fpath,
+            'filename': fname,
+            'name_similarity': round(name_sim, 2),
+            'artist_match': artist_match,
+            'duration': round(actual_dur, 1),
+            'expected_duration': round(expected_s, 1),
+            'duration_match': duration_match,
+            'dur_diff': round(dur_diff, 2),
+        })
+
+    if not candidates:
+        return {'exists': False, 'files': [], 'confidence': 'high', 'recommendation': 'download'}
+
+    # 按匹配度排序
+    candidates.sort(key=lambda c: (
+        c['name_similarity'] + (0.3 if c['artist_match'] else 0) + (0.3 if c['duration_match'] else 0)
+    ), reverse=True)
+
+    best = candidates[0]
+
+    # 判定置信度
+    if best['name_similarity'] >= 0.8 and best['artist_match'] and best['duration_match']:
+        confidence = 'high'
+        recommendation = 'skip'
+    elif best['name_similarity'] >= 0.8 and best['duration_match']:
+        confidence = 'high'
+        recommendation = 'skip'
+    elif best['name_similarity'] >= 0.6 and best['duration_match']:
+        confidence = 'medium'
+        recommendation = 'skip'
+    elif best['name_similarity'] >= 0.6:
+        # 歌名对上但时长不对 → 可能是不同版本/重制版
+        confidence = 'low'
+        recommendation = 'ask'
+    elif best['name_similarity'] >= 0.8 and not best['duration_match']:
+        confidence = 'low'
+        recommendation = 'ask'
+    else:
+        confidence = 'medium'
+        recommendation = 'download'
+
+    return {
+        'exists': True,
+        'files': candidates,
+        'best': best,
+        'confidence': confidence,
+        'recommendation': recommendation,
+    }
+
+
+def _remove_file_safe(fpath: str):
+    """安全删除文件及配套的 .lrc"""
+    try:
+        os.remove(fpath)
+    except Exception:
+        pass
+    lrc = os.path.splitext(fpath)[0] + '.lrc'
+    if os.path.exists(lrc):
+        try:
+            os.remove(lrc)
+        except Exception:
+            pass
+
+
 # ─── 多源下载核心 ───
 
 def _try_source(client_type, client_label, keyword, artists_str,
                 expected_duration_ms, output_dir):
-    """尝试从一个源搜索+下载，成功后返回结果dict"""
     client = create_client(client_type, work_dir=output_dir)
     results = search_with_retry(client, keyword)
     if not results:
@@ -191,7 +325,6 @@ def _try_source(client_type, client_label, keyword, artists_str,
             dur = _format_duration(integrity['actual'])
             if integrity['expected'] > 0:
                 dur += f"/{_format_duration(integrity['expected'])}"
-            # Strip random suffix from filename
             cleaned = _clean_song_path(fpath)
             if cleaned != fpath:
                 fpath = cleaned
@@ -206,19 +339,47 @@ def _try_source(client_type, client_label, keyword, artists_str,
         if integrity['expected'] > 0:
             dur += f" 预期{_format_duration(integrity['expected'])}"
         print(f"      ⚠️ {dur}")
-        try:
-            os.remove(fpath)
-            lrc = os.path.splitext(fpath)[0] + '.lrc'
-            if os.path.exists(lrc):
-                os.remove(lrc)
-        except Exception:
-            pass
+        _remove_file_safe(fpath)
 
     return None
 
 
-def _multi_source_download(keyword, artists_str, expected_duration_ms, output_dir):
-    """跨源链搜索+下载"""
+def _multi_source_download(keyword, artists_str, expected_duration_ms, output_dir,
+                           duplicate_action='coexist'):
+    """
+    跨源链搜索+下载，支持重复处理策略。
+
+    duplicate_action:
+      'skip'      - 跳过已存在的
+      'overwrite' - 删除旧文件后下载新文件
+      'coexist'   - 直接下载（musicdl 会自动加 (1) 后缀）
+    """
+    # 检查重复
+    dup = _find_duplicate(keyword.split()[0] if ' ' not in keyword else keyword,
+                          artists_str, expected_duration_ms, output_dir)
+    # 更精确地提取歌名：取 keyword 中不是歌手名的部分
+    song_only = keyword
+    if artists_str:
+        for a in artists_str.split(','):
+            song_only = song_only.replace(a.strip(), '').strip()
+    dup = _find_duplicate(song_only or keyword, artists_str, expected_duration_ms, output_dir)
+
+    if dup['exists'] and dup['recommendation'] == 'skip' and duplicate_action in ('skip', 'coexist'):
+        best = dup['best']
+        print(f"    ℹ️ 已存在（匹配度: {best['name_similarity']:.0%}）")
+        print(f"      现有: {best['filename']} ({_format_duration(best['duration'])})")
+        return {
+            'path': best['path'], 'integrity': None, 'downloaded': True,
+            'source': '已存在', 'file_size': os.path.getsize(best['path']) if os.path.exists(best['path']) else 0,
+            'duplicate': True, 'action': 'skipped',
+        }
+
+    if dup['exists'] and duplicate_action == 'overwrite':
+        best = dup['best']
+        print(f"    ♻️ 覆盖已有: {best['filename']}")
+        _remove_file_safe(best['path'])
+
+    # 正常下载
     for client_type, label, _, do_match in SOURCE_CHAIN:
         src_artists = artists_str if do_match else ""
         print(f"    📡 [{label}] 搜索中...")
@@ -226,6 +387,7 @@ def _multi_source_download(keyword, artists_str, expected_duration_ms, output_di
                              expected_duration_ms, output_dir)
         if result:
             return result
+
     return {'path': None, 'integrity': None, 'downloaded': False, 'source': '全部失败'}
 
 
@@ -250,21 +412,85 @@ def cmd_search(args):
         print()
 
 
+# ─── 命令: check-duplicate ───
+
+def cmd_check_duplicate(args):
+    """检查指定歌曲是否已存在（供 agent 决策前调用）"""
+    # 解析 --action 参数
+    action = 'coexist'
+    rest = list(args)
+    if '--action' in rest:
+        idx = rest.index('--action')
+        if idx + 1 < len(rest):
+            action = rest[idx + 1]
+            rest = rest[:idx] + rest[idx+2:]
+
+    keyword = ' '.join(rest)
+    if not keyword:
+        print("用法: music.py check-duplicate <关键词> [--action skip|overwrite|coexist]")
+        return
+
+    # 分离歌名和歌手
+    parts = keyword.rsplit(' ', 1)
+    song_name = keyword
+    artists = ''
+    if len(parts) > 1 and not parts[1].startswith('--'):
+        song_name = parts[0]
+        artists = parts[1]
+
+    dup = _find_duplicate(song_name, artists, 0, WORK_DIR)
+    print(json.dumps(dup, ensure_ascii=False, default=str))
+
+
 # ─── 命令: download ───
 
 def cmd_download(args):
-    keyword = ' '.join(args)
+    """下载单首歌曲，支持 --action 参数"""
+    action = 'coexist'
+    rest = list(args)
+    if '--action' in rest:
+        idx = rest.index('--action')
+        if idx + 1 < len(rest):
+            action = rest[idx + 1]
+            rest = rest[:idx] + rest[idx+2:]
+
+    keyword = ' '.join(rest)
     if not keyword:
-        print("用法: music.py download <关键词>")
+        print("用法: music.py download <关键词> [--action skip|overwrite|coexist]")
         return
 
-    result = _multi_source_download(keyword, "", 0, WORK_DIR)
-    if result['downloaded']:
+    # 检测重复并输出结构化信息
+    parts = keyword.rsplit(' ', 1)
+    song_name = keyword
+    artists = ''
+    if len(parts) > 1:
+        song_name = parts[0]
+        artists = parts[1]
+
+    dup = _find_duplicate(song_name, artists, 0, WORK_DIR)
+    if dup['exists'] and dup['recommendation'] == 'ask' and action == 'coexist':
+        # 拿捏不准，输出 JSON 让 agent 决策
+        print(json.dumps({
+            'type': 'duplicate_ask',
+            'message': f"「{keyword}」可能已存在但时长不匹配，请确认如何处理",
+            'duplicate': dup,
+            'keyword': keyword,
+        }, ensure_ascii=False, default=str))
+        return
+
+    result = _multi_source_download(keyword, "", 0, WORK_DIR, duplicate_action=action)
+    if result.get('duplicate'):
+        print(f"\nℹ️ 已跳过（已存在）")
+    elif result['downloaded']:
         integ = result['integrity']
-        print(f"\n✅ 下载成功 [{result['source']}]")
-        print(f"   保存: {result['path']}")
-        print(f"   时长: {_format_duration(integ['actual'])}"
-              f"{'/' + _format_duration(integ['expected']) if integ['expected'] > 0 else ''}")
+        src = result['source']
+        if integ:
+            print(f"\n✅ 下载成功 [{src}]")
+            print(f"   保存: {result['path']}")
+            print(f"   时长: {_format_duration(integ['actual'])}"
+                  f"{'/' + _format_duration(integ['expected']) if integ and integ['expected'] > 0 else ''}")
+        else:
+            print(f"\nℹ️ 已跳过（已存在）")
     else:
         print(f"\n❌ 所有 {len(SOURCE_CHAIN)} 个源均无法下载完整版本")
 
@@ -272,18 +498,31 @@ def cmd_download(args):
 # ─── 命令: download-idx ───
 
 def cmd_download_idx(args):
-    if len(args) < 2:
-        print("用法: music.py download-idx <序号> <关键词>")
+    action = 'coexist'
+    rest = list(args)
+    if '--action' in rest:
+        idx = rest.index('--action')
+        if idx + 1 < len(rest):
+            action = rest[idx + 1]
+            rest = rest[:idx] + rest[idx+2:]
+
+    if len(rest) < 2:
+        print("用法: music.py download-idx <序号> <关键词> [--action skip|overwrite|coexist]")
         return
     try:
-        idx = int(args[0]) - 1
+        idx = int(rest[0]) - 1
     except ValueError:
         print("序号必须是数字")
         return
-    keyword = ' '.join(args[1:])
-    result = _multi_source_download(keyword, "", 0, WORK_DIR)
-    if result['downloaded']:
+    keyword = ' '.join(rest[1:])
+
+    result = _multi_source_download(keyword, "", 0, WORK_DIR, duplicate_action=action)
+    if result.get('duplicate'):
+        print(f"ℹ️ {keyword} 已存在，跳过")
+    elif result['downloaded']:
         print(f"✅ [{result['source']}] {result['path']}")
+        if result.get('integrity'):
+            print(f"   时长: {_format_duration(result['integrity']['actual'])}")
     else:
         print(f"❌ 所有 {len(SOURCE_CHAIN)} 个源均无法下载完整版本")
 
@@ -291,11 +530,21 @@ def cmd_download_idx(args):
 # ─── 命令: download-playlist ───
 
 def cmd_download_playlist(args):
-    if not args:
-        print("用法: music.py download-playlist <歌单URL>")
+    """下载歌单，支持逐首决策 + 批量应用"""
+    action = 'coexist'
+    batch_action = None  # None = 未设置，'skip'/overwrite/coexist = 应用到所有剩余
+    rest = list(args)
+    if '--action' in rest:
+        idx = rest.index('--action')
+        if idx + 1 < len(rest):
+            action = rest[idx + 1]
+            rest = rest[:idx] + rest[idx+2:]
+
+    if not rest:
+        print("用法: music.py download-playlist <歌单URL> [--action skip|overwrite|coexist]")
         return
 
-    url = args[0].strip()
+    url = rest[0].strip()
     playlist_id = _parse_playlist_id(url)
     print(f"📋 歌单ID: {playlist_id}")
 
@@ -321,7 +570,7 @@ def cmd_download_playlist(args):
     print(f"🎵 {playlist_name} ({len(tracks)} 首)")
     print(f"📁 保存: {output_dir}/")
 
-    success, incomplete, failed, results_log = 0, 0, 0, []
+    success, incomplete, failed, skipped_count, results_log = 0, 0, 0, 0, []
 
     for i, track in enumerate(tracks, 1):
         raw_artists = track.get('ar') or track.get('artists', [])
@@ -334,16 +583,66 @@ def cmd_download_playlist(args):
         if expected_duration:
             print(f"      预期: {_format_duration(expected_duration / 1000)}")
 
-        dl_result = _multi_source_download(keyword, artists, expected_duration, output_dir)
+        # 检查重复
+        dup = _find_duplicate(song_name, artists, expected_duration, output_dir)
+
+        if dup['exists']:
+            best = dup['best']
+            print(f"    ⚠️ 检测到可能重复: {best['filename']}")
+            print(f"       歌名匹配: {best['name_similarity']:.0%}"
+                  f", 歌手匹配: {'✅' if best['artist_match'] else '❌'}"
+                  f", 时长匹配: {'✅' if best['duration_match'] else '❌'}")
+
+            if batch_action:
+                # 已有批量决策，直接使用
+                current_action = batch_action
+                action_label = {'skip': '跳过', 'overwrite': '覆盖', 'coexist': '并存'}.get(current_action, '并存')
+                print(f"      → 批量策略: {action_label}")
+            else:
+                # 输出结构化 JSON，让 agent 问询用户
+                print(json.dumps({
+                    'type': 'playlist_duplicate',
+                    'index': i,
+                    'total': len(tracks),
+                    'song_name': song_name,
+                    'artists': artists,
+                    'duplicate': dup,
+                    'expected_duration_ms': expected_duration,
+                    'message': f"「{song_name} — {artists}」可能已存在，选择如何处理",
+                }, ensure_ascii=False, default=str))
+                # 默认走 coexist 继续（脚本不能交互，靠 agent 处理）
+                current_action = action
+
+            if current_action == 'skip':
+                print(f"    ℹ️ 跳过（保留原有）")
+                skipped_count += 1
+                results_log.append((song_name, artists, best['duration'],
+                                    expected_duration / 1000, 'ℹ️ 跳过(已存在)'))
+                continue
+            elif current_action == 'overwrite':
+                print(f"    ♻️ 覆盖: {best['filename']}")
+                _remove_file_safe(best['path'])
+
+        # 下载
+        dl_result = _multi_source_download(keyword, artists, expected_duration, output_dir,
+                                           duplicate_action=action)
+
+        if dl_result.get('duplicate') or dl_result.get('action') == 'skipped':
+            skipped_count += 1
+            results_log.append((song_name, artists,
+                                dl_result.get('integrity', {}).get('actual', 0) or 0,
+                                expected_duration / 1000, 'ℹ️ 跳过(已存在)'))
+            print(f"    ℹ️ 已存在，跳过")
+            continue
 
         if dl_result['downloaded']:
             integ = dl_result['integrity']
             src = dl_result['source']
-            actual = integ['actual']
-            expected = integ['expected']
+            actual = integ['actual'] if integ else 0
+            expected = integ['expected'] if integ else 0
             fsize = dl_result.get('file_size', 0)
 
-            if integ['status'] == 'ok':
+            if integ and integ['status'] == 'ok':
                 success += 1
                 label = '✅ 完整'
             else:
@@ -365,15 +664,23 @@ def cmd_download_playlist(args):
     print(f"  📊 下载报告: {playlist_name}")
     print(f"{'='*65}")
     print(f"  路径: {output_dir}/")
-    print(f"  总计: {total}  |  ✅ 完整: {success}  |  ⚠️ 不完整: {incomplete}  |  ❌ 失败: {failed}")
+    print(f"  总计: {total}  |  ✅ 完整: {success}"
+          f"  |  ⚠️ 不完整: {incomplete}"
+          f"  |  ℹ️ 跳过(已存在): {skipped_count}"
+          f"  |  ❌ 失败: {failed}")
     print(f"  ── 明细 ──")
     for song, artist, actual, expected, status in results_log:
         label = status[:4]
-        rest = status[4:]
-        print(f"  {label} {rest:>30}  {song}")
+        rest_s = status[4:]
+        print(f"  {label} {rest_s:>30}  {song}")
         if artist:
             print(f"  {'':>36}{artist}")
     print(f"{'='*65}")
+
+    # 如果有重复但没设置批量策略，输出提示
+    if skipped_count > 0 and not batch_action:
+        print(f"\n💡 提示: {skipped_count} 首歌已存在被跳过。如需覆盖或并存，")
+        print(f"   重新运行加上 --action overwrite（覆盖）或 --action coexist（并存）")
 
 
 # ─── 命令: check-playlist ───
@@ -484,10 +791,9 @@ def cmd_check_playlist(args):
     print(f"{'='*65}")
 
 
-# ─── 命令: rename (批量清理文件名后缀) ───
+# ─── 命令: rename ───
 
 def cmd_rename(args):
-    """遍历目录，清理所有音乐文件的随机ID后缀"""
     target = args[0] if args else WORK_DIR
     target = os.path.expanduser(target)
     if not os.path.exists(target):
@@ -527,7 +833,6 @@ def cmd_rename(args):
             except Exception:
                 pass
 
-    # Phase 2: rename remaining files, strip suffix
     remaining = []
     for root, dirs, fnames in os.walk(target):
         for f in fnames:
@@ -542,15 +847,19 @@ def cmd_rename(args):
 
     print(f"\n📊 清理完成: {renamed} 已重命名, {removed} 重复已删除")
 
+
 # ─── 入口 ───
 
 def main():
     if len(sys.argv) < 2:
-        print("用法:"); print("  music.py search <关键词>")
-        print("  music.py download <关键词>"); print("  music.py download-idx <N> <关键词>")
-        print("  music.py download-playlist <URL>")
+        print("用法:")
+        print("  music.py search <关键词>")
+        print("  music.py download <关键词> [--action skip|overwrite|coexist]")
+        print("  music.py download-idx <N> <关键词> [--action skip|overwrite|coexist]")
+        print("  music.py check-duplicate <关键词> [--dir <路径>]")
+        print("  music.py download-playlist <URL> [--action skip|overwrite|coexist]")
         print("  music.py check-playlist <路径> [--playlist-url <URL>]")
-        print("  music.py rename [路径]   -- 清理文件名中的随机ID后缀")
+        print("  music.py rename [路径]")
         return
 
     cmd, args = sys.argv[1], sys.argv[2:]
@@ -562,12 +871,15 @@ def main():
         cmd_download_idx(args)
     elif cmd in ('download-playlist', 'download_playlist', 'playlist'):
         cmd_download_playlist(args)
+    elif cmd == 'check-duplicate':
+        cmd_check_duplicate(args)
     elif cmd in ('check-playlist', 'check_playlist', 'check'):
         cmd_check_playlist(args)
     elif cmd == 'rename':
         cmd_rename(args)
     else:
         print(f"未知命令: {cmd}")
+
 
 if __name__ == '__main__':
     main()
